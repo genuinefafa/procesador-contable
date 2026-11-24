@@ -465,6 +465,86 @@ const issuedInvoices_ = sqliteTable(
 export { issuedInvoices_ as issuedInvoices };
 
 // =============================================================================
+// BANK STATEMENTS - bronze layer. One row per line of every source (monthly PDF,
+// API JSON), append-only: UPDATE/DELETE are blocked by triggers (see migration).
+// The same real movement shows up once per source; silver links them.
+// =============================================================================
+
+/** Sources a bronze bank row can come from. */
+export const BANK_SOURCES = ['icbc_pdf', 'icbc_api'] as const;
+export type BankSource = (typeof BANK_SOURCES)[number];
+
+const bankImports_ = sqliteTable(
+  'bank_imports',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    source: text('source', { enum: BANK_SOURCES }).notNull(),
+    filename: text('filename').notNull(),
+    sha256: text('sha256').notNull(), // of the imported bytes
+    account: text('account').notNull(), // as printed by the bank, e.g. 0000/00000000/00
+    periodFrom: text('period_from').notNull(), // YYYY-MM-DD
+    periodTo: text('period_to').notNull(),
+    openingBalance: real('opening_balance'), // PDF only
+    closingBalance: real('closing_balance'), // PDF only
+    rowCount: integer('row_count').notNull(), // rows in the file
+    newCount: integer('new_count').notNull(), // rows inserted by this import
+    importedAt: text('imported_at')
+      .notNull()
+      .default(sql`CURRENT_TIMESTAMP`),
+  },
+  (table) => ({
+    uniqueSha: uniqueIndex('unique_bank_import_sha').on(table.sha256),
+  })
+);
+
+export { bankImports_ as bankImports };
+
+const bankMovements_ = sqliteTable(
+  'bank_movements',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    importId: integer('import_id') // first import that brought this row
+      .notNull()
+      .references(() => bankImports_.id),
+    source: text('source', { enum: BANK_SOURCES }).notNull(),
+    account: text('account').notNull(),
+    rowNumber: integer('row_number').notNull(), // position within the source file (1-based)
+    rowKey: text('row_key').notNull(), // API: transactionNumber; PDF: <YYYY-MM>#<ordinal>
+    contentHash: text('content_hash').notNull(), // sha256 of the row content
+    date: text('date').notNull(), // YYYY-MM-DD
+    valueDate: text('value_date'),
+    operatedAt: text('operated_at'), // ISO datetime, API only
+    concept: text('concept').notNull(),
+    conceptCode: text('concept_code'), // API only
+    ticket: text('ticket'), // PDF COMPROBANTE / API ticketNumber
+    amount: real('amount').notNull(), // signed: debits are negative
+    balance: real('balance'), // running balance; PDF prints it only at day end
+    origin: text('origin'), // PDF only
+    channel: text('channel'),
+    counterpartName: text('counterpart_name'), // API only
+    counterpartTaxId: text('counterpart_tax_id'), // digits only, API only
+    counterpartCbu: text('counterpart_cbu'), // API only
+    counterpartBank: text('counterpart_bank'), // API only
+    reasonCode: text('reason_code'), // API only
+    reason: text('reason'), // API only
+    raw: text('raw').notNull(), // untouched source line (PDF text line or JSON element)
+  },
+  (table) => ({
+    uniqueRow: uniqueIndex('unique_bank_movement_row').on(
+      table.source,
+      table.account,
+      table.rowKey,
+      table.contentHash
+    ),
+    dateIdx: index('idx_bank_movements_date').on(table.date),
+    ticketIdx: index('idx_bank_movements_ticket').on(table.ticket),
+    importIdx: index('idx_bank_movements_import').on(table.importId),
+  })
+);
+
+export { bankMovements_ as bankMovements };
+
+// =============================================================================
 // TIPOS TYPESCRIPT
 // =============================================================================
 
@@ -499,6 +579,12 @@ export type NewExpectedInvoice = typeof expectedInvoices_.$inferInsert;
 
 export type IssuedInvoice = typeof issuedInvoices_.$inferSelect;
 export type NewIssuedInvoice = typeof issuedInvoices_.$inferInsert;
+
+export type BankImport = typeof bankImports_.$inferSelect;
+export type NewBankImport = typeof bankImports_.$inferInsert;
+
+export type BankMovement = typeof bankMovements_.$inferSelect;
+export type NewBankMovement = typeof bankMovements_.$inferInsert;
 
 export type Category = typeof categories_.$inferSelect;
 export type NewCategory = typeof categories_.$inferInsert;
