@@ -1,17 +1,18 @@
 /**
  * Parser of the ICBC monthly statement ("RESUMEN MENSUAL"), from the text
- * pdf-parse extracts. The sheet is printed twice (one copy per address); both
- * copies must match, and the movements must close against the balances.
+ * pdf-parse extracts. Only used to convert old statements to API-shaped JSON
+ * (scripts/icbc-pdf-to-json.ts); the app itself never reads PDFs.
+ *
+ * The sheet is printed twice (one copy per address): both copies must match,
+ * and every printed balance must match the running balance.
  */
 
-import { createHash } from 'crypto';
-import { BankParseError, toCents, type BankRowInput, type ParsedBankFile } from './icbc-types.js';
+import { BankParseError, parseBankAmount, toCents } from './icbc-types.js';
 
 const OPENING = /SALDO ULTIMO EXTRACTO AL \d{2}\/\d{2}\/\d{4}\s+([\d.]+,\d{2}-?)/;
 const CLOSING = /SALDO FINAL AL \d{2}\/\d{2}\/\d{4}\s+([\d.]+,\d{2}-?)/;
 const PERIOD = /PERIODO (\d{2})-(\d{2})-(\d{4}) AL (\d{2})-(\d{2})-(\d{4})/;
 const ACCOUNT = /N° (\d{4}\/\d{8}\/\d{2})/;
-const CUIT = /CUIT N° (\d{2}-\d{8}-\d)/;
 const MOVEMENT = /^\d{2}-\d{2} /;
 const AMOUNT = /[\d.]+,\d{2}-?/g;
 
@@ -25,9 +26,26 @@ const COL = {
   amounts: [62, undefined],
 } as const;
 
-function parseAmount(text: string): number {
-  const value = Number(text.replace('-', '').replaceAll('.', '').replace(',', '.'));
-  return text.endsWith('-') ? -value : value;
+export interface StatementLine {
+  date: string; // YYYY-MM-DD
+  valueDate: string | null;
+  concept: string;
+  ticket: string | null;
+  origin: string | null;
+  channel: string | null;
+  amount: number;
+  /** Running balance after this line (printed only at the end of each day). */
+  balance: number;
+  raw: string;
+}
+
+export interface ParsedStatement {
+  account: string;
+  periodFrom: string;
+  periodTo: string;
+  openingBalance: number;
+  closingBalance: number;
+  lines: StatementLine[];
 }
 
 /** dd-mm printed without year: the closest one to the statement month (Dec/Jan value dates). */
@@ -38,31 +56,7 @@ function resolveDate(ddmm: string, year: number, month: number): string {
   return `${y}-${mm}-${dd}`;
 }
 
-function parseLine(
-  raw: string,
-  year: number,
-  month: number
-): Omit<BankRowInput, 'rowNumber' | 'rowKey' | 'contentHash'> {
-  const col = (c: readonly [number, number | undefined]): string => raw.slice(c[0], c[1]).trim();
-  const amounts = [...col(COL.amounts).matchAll(AMOUNT)].map((m) => m[0]);
-  if (amounts.length === 0 || amounts.length > 2) {
-    throw new BankParseError(`Línea de movimiento sin importe reconocible: "${raw.trim()}"`);
-  }
-  const value = col(COL.valueDate);
-  return {
-    date: resolveDate(raw.slice(0, 5), year, month),
-    valueDate: /^\d{2}-\d{2}$/.test(value) ? resolveDate(value, year, month) : null,
-    concept: col(COL.concept),
-    ticket: col(COL.ticket) || null,
-    origin: col(COL.origin) || null,
-    channel: col(COL.channel) || null,
-    amount: parseAmount(amounts[0]!),
-    balance: amounts[1] ? parseAmount(amounts[1]) : null,
-    raw,
-  };
-}
-
-export function parseIcbcStatementText(text: string): ParsedBankFile {
+export function parseIcbcStatementText(text: string): ParsedStatement {
   const period = text.match(PERIOD);
   const account = text.match(ACCOUNT)?.[1];
   if (!period || !account) {
@@ -73,10 +67,9 @@ export function parseIcbcStatementText(text: string): ParsedBankFile {
   const month = Number(m1);
 
   // Split into copies, each from its "SALDO ULTIMO EXTRACTO" to its "SALDO FINAL".
-  const lines = text.split(/\r?\n/);
   const copies: Array<{ opening: string; closing: string; rows: string[] }> = [];
   let current: { opening: string; rows: string[] } | null = null;
-  for (const line of lines) {
+  for (const line of text.split(/\r?\n/)) {
     const opening = line.match(OPENING);
     if (opening) {
       if (current) throw new BankParseError('Dos saldos iniciales seguidos en el PDF');
@@ -101,29 +94,47 @@ export function parseIcbcStatementText(text: string): ParsedBankFile {
     throw new BankParseError('Las copias de la hoja no coinciden entre sí');
   }
 
-  const openingBalance = parseAmount(first.opening);
-  const closingBalance = parseAmount(first.closing);
-  const parsed = first.rows.map((raw) => parseLine(raw, year, month));
-  const total = parsed.reduce((sum, r) => sum + toCents(r.amount), toCents(openingBalance));
-  if (total !== toCents(closingBalance)) {
+  const openingBalance = parseBankAmount(first.opening);
+  const closingBalance = parseBankAmount(first.closing);
+  let running = toCents(openingBalance);
+  const lines = first.rows.map((raw): StatementLine => {
+    const col = (c: readonly [number, number | undefined]): string => raw.slice(c[0], c[1]).trim();
+    const amounts = [...col(COL.amounts).matchAll(AMOUNT)].map((m) => m[0]);
+    if (amounts.length === 0 || amounts.length > 2) {
+      throw new BankParseError(`Línea de movimiento sin importe reconocible: "${raw.trim()}"`);
+    }
+    const amount = parseBankAmount(amounts[0]!);
+    running += toCents(amount);
+    if (amounts[1] && toCents(parseBankAmount(amounts[1])) !== running) {
+      throw new BankParseError(
+        `El saldo impreso ${amounts[1]} no coincide con el calculado ${running / 100}: "${raw.trim()}"`
+      );
+    }
+    const value = col(COL.valueDate);
+    return {
+      date: resolveDate(raw.slice(0, 5), year, month),
+      valueDate: /^\d{2}-\d{2}$/.test(value) ? resolveDate(value, year, month) : null,
+      concept: col(COL.concept),
+      ticket: col(COL.ticket) || null,
+      origin: col(COL.origin) || null,
+      channel: col(COL.channel) || null,
+      amount,
+      balance: running / 100,
+      raw,
+    };
+  });
+  if (running !== toCents(closingBalance)) {
     throw new BankParseError(
-      `El saldo no cierra: inicial ${first.opening} + movimientos = ${total / 100}, final ${first.closing}`
+      `El saldo no cierra: calculado ${running / 100}, final impreso ${first.closing}`
     );
   }
 
   return {
-    source: 'icbc_pdf',
     account,
-    holderCuit: text.match(CUIT)?.[1]?.replaceAll('-', '') ?? null,
     periodFrom: `${y1}-${m1}-${d1}`,
     periodTo: `${y2}-${m2}-${d2}`,
     openingBalance,
     closingBalance,
-    rows: parsed.map((r, i) => ({
-      ...r,
-      rowNumber: i + 1,
-      rowKey: `${y1}-${m1}#${i + 1}`,
-      contentHash: createHash('sha256').update(r.raw.trimEnd()).digest('hex'),
-    })),
+    lines,
   };
 }
