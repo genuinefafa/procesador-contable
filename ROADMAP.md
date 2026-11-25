@@ -99,7 +99,7 @@ Plan de trabajo organizado en fases progresivas, alternando features con tech de
 | #231 | Aviso de importación cuenta completables que el filtro no muestra (secundarias de balance group) | Pendiente |
 | - | Importar comprobantes emitidos (Mis Comprobantes Emitidos), tabla `issued_invoices` + vista `v_emitidas_oro`, validación de CUIT propio (`COMPANY_CUIT`) | ✅ PR #228 |
 | - | Gráficos ingresos vs gastos (neto) e IVA ventas vs IVA compras (sin percepciones), cobertura de recibidos sin cargar | ✅ PR #229 |
-| #243 | Bronce de bancos: resumen mensual PDF y JSON de la API de ICBC, inmutable y con el origen de cada fila (`bank_imports`, `bank_movements`) | 🔄 PR abierto |
+| #243 | Bronce de bancos: JSON de la API de ICBC, inmutable y con el origen de cada fila (`bank_imports`, `bank_movements`); los PDF viejos entran una vez, convertidos a JSON | 🔄 PR abierto |
 | #212 | Crear factura desde archivo ya finalizado borra el archivo (copyFile origen = destino) | ✅ PR #214 |
 | #213 | Rediseñar comparación archivo ↔ esperada del pendiente | Pendiente |
 | #234 | Detalle con id sin prefijo da 500; total vacío se muestra como $0,00 | Pendiente |
