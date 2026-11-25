@@ -1,5 +1,5 @@
 /**
- * Hono router for /api/bank: bronze bank statements (ICBC PDF and API JSON).
+ * Hono router for /api/bank: bronze bank movements (ICBC API JSON).
  */
 
 import { Hono } from 'hono';
@@ -21,7 +21,7 @@ bankRouter.post('/imports', async (c) => {
   }
   try {
     const bytes = Buffer.from(await file.arrayBuffer());
-    const result = await new BankImportService().importFile(bytes, file.name);
+    const result = new BankImportService().importFile(bytes, file.name);
     return c.json({ success: true, ...result });
   } catch (error) {
     if (error instanceof BankParseError) {
@@ -37,12 +37,16 @@ bankRouter.get('/imports', (c) => {
   return c.json({ success: true, count: imports.length, imports });
 });
 
-// GET /api/bank/movements?from=&to=&source=&importId=
+// GET /api/bank/movements?from=&to=&source=&importId=&versions=latest|all
 bankRouter.get('/movements', (c) => {
   const parsed = BankMovementsQuerySchema.safeParse(c.req.query());
   if (!parsed.success) {
     return c.json(formatZodError(parsed.error), 400);
   }
-  const movements = new BankRepository().listMovements(parsed.data);
+  const { versions, ...filters } = parsed.data;
+  const movements = new BankRepository().listMovements({
+    ...filters,
+    allVersions: versions === 'all',
+  });
   return c.json({ success: true, count: movements.length, movements });
 });

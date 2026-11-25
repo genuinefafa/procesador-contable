@@ -1,5 +1,5 @@
 /**
- * Contracts for /api/bank (bronze bank statements).
+ * Contracts for /api/bank (bronze bank movements).
  */
 
 import * as z from 'zod';
@@ -13,6 +13,8 @@ export const BankMovementsQuerySchema = z.object({
   to: dateStringSchema.optional(),
   source: z.enum(BANK_SOURCES).optional(),
   importId: z.coerce.number().int().positive().optional(),
+  /** `all` also returns the versions the bank replaced */
+  versions: z.enum(['latest', 'all']).optional(),
 });
 
 export type BankMovementsQuery = z.infer<typeof BankMovementsQuerySchema>;

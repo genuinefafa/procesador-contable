@@ -1,5 +1,5 @@
 /**
- * Imports bank files (ICBC monthly PDF or API JSON) into bronze.
+ * Imports ICBC API JSON files (or PDFs converted with icbc-pdf-to-json.ts) into bronze.
  *
  * Usage:
  *   bun run bank:import -- <file>...        # parse and validate only
@@ -16,7 +16,7 @@ import { BankImportService, parseBankFile } from '../services/bank-import.servic
 const save = process.argv.includes('--save');
 const files = process.argv.slice(2).filter((a) => a !== '--save');
 
-async function main(): Promise<number> {
+function main(): number {
   console.info(save ? `DB: ${DB_PATH}\n` : 'Validate only (use --save to store)\n');
   const service = new BankImportService();
   let failed = 0;
@@ -25,16 +25,20 @@ async function main(): Promise<number> {
     try {
       const bytes = readFileSync(path);
       if (!save) {
-        const p = await parseBankFile(bytes);
-        console.info(`${name}: ${p.source} ${p.periodFrom}..${p.periodTo} ${p.rows.length} rows`);
+        const p = parseBankFile(bytes);
+        const span = `${p.rows[0]!.transactionNumber}..${p.rows.at(-1)!.transactionNumber}`;
+        console.info(
+          `${name}: ${p.source} ${p.periodFrom}..${p.periodTo} #${span} ${p.rows.length} rows`
+        );
         continue;
       }
-      const r = await service.importFile(bytes, name);
+      const r = service.importFile(bytes, name);
       console.info(
         r.alreadyImported
           ? `${name}: already imported (#${r.import.id})`
           : `${name}: ${r.newRows} new, ${r.knownRows} known, ${r.changedRows} changed`
       );
+      for (const w of r.warnings) console.warn(`  ! ${w}`);
     } catch (error) {
       failed++;
       console.error(`${name}: ${error instanceof Error ? error.message : String(error)}`);
@@ -43,4 +47,4 @@ async function main(): Promise<number> {
   return failed;
 }
 
-process.exit((await main()) > 0 ? 1 : 0);
+process.exit(main() > 0 ? 1 : 0);

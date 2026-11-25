@@ -1,21 +1,19 @@
 /**
- * Bronze bank statements: ICBC parsers, append-only import and API.
+ * Bronze bank movements: ICBC statement parser (used by the PDF → JSON
+ * converter), API JSON parser, append-only import and HTTP API.
  *
  * Fictitious data only (CUITs from CLAUDE.md, invented accounts and amounts).
  */
 
-import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
 import { getRawDb } from '../../database/db.js';
 import { cleanupTestDb, runTestMigrations, resetTestDb } from '../../database/db-test.js';
 import { BankRepository } from '../../database/repositories/bank.js';
 import { parseIcbcApiJson } from '../../parsers/icbc-api.js';
 import { parseIcbcStatementText } from '../../parsers/icbc-pdf.js';
+import { formatBankAmount, parseBankAmount } from '../../parsers/icbc-types.js';
 import { BankImportService } from '../../services/bank-import.service.js';
 import { app } from '../../http/app.js';
-
-vi.mock('pdf-parse', () => ({
-  default: async (bytes: Buffer) => ({ text: bytes.toString('utf-8').replace('%PDF-fake\n', '') }),
-}));
 
 const ACCOUNT = '0001/00000001/01';
 
@@ -49,6 +47,7 @@ const LINES: Line[] = [
     ticket: '1000001',
     channel: 'DNET',
     amount: '1.500,50',
+    balance: '2.400,50',
   },
   {
     date: '09-01',
@@ -60,26 +59,26 @@ const LINES: Line[] = [
   },
 ];
 
-function copy(lines: Line[], opening: string, closing: string): string {
+function copy(lines: Line[], closing: string): string {
   return [
     'RESUMEN MENSUAL',
     'PERIODO 01-01-2026 AL 31-01-2026',
     'CUIT N° 30-12345678-9',
     `INFORMACION SOBRE SU CUENTA CORRIENTE EN PESOS      N° ${ACCOUNT} C.B.U.: 0`,
-    `SALDO ULTIMO EXTRACTO AL 31/12/2025          ${opening}`,
+    'SALDO ULTIMO EXTRACTO AL 31/12/2025          1.000,00',
     ...lines.map(pdfLine),
     `TOT.LEY COMP.$ 1,00(*) SALDO FINAL AL 31/01/2026          ${closing}`,
-    'SALDO PAGINA ANTERIOR          2.000,25',
   ].join('\n');
 }
 
 const statement = (lines = LINES, closing = '2.000,25'): string =>
-  [copy(lines, '1.000,00', closing), copy(lines, '1.000,00', closing)].join('\n');
+  [copy(lines, closing), copy(lines, closing)].join('\n');
 
 // 2026-03-10T00:00 in Argentina
 const MARCH_10 = Date.UTC(2026, 2, 10, 3);
 
-function element(n: number, over: Record<string, unknown> = {}) {
+/** API element n: starts at a balance of 10.000,00 and pays 100,00 each. */
+function element(n: number, over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     action: { primaryAction: 'go_details' },
     transactionNumber: String(n),
@@ -90,8 +89,8 @@ function element(n: number, over: Record<string, unknown> = {}) {
     concept: 'TR. A CTA ',
     transactionCode: '978',
     ticketNumber: '1000001',
-    amount: -1500.5,
-    transactionBalance: '1.000,25',
+    amount: -100,
+    transactionBalance: formatBankAmount(10000 - 100 * n),
     channel: 'DATANET',
     beneficiary: 'PERSONA DE PRUEBA',
     docNumber: '20-12345678-9',
@@ -103,54 +102,59 @@ function element(n: number, over: Record<string, unknown> = {}) {
   };
 }
 
-const response = (elements: unknown[], body: Record<string, unknown> = {}) => ({
+const response = (elements: unknown[], extra: Record<string, unknown> = {}) => ({
   state: 'OK',
-  body: { elements, hasMoreElements: false, totalElementCount: elements.length, ...body },
+  ...extra,
+  body: { elements, hasMoreElements: false, totalElementCount: elements.length },
 });
-const bytes = (json: unknown) => Buffer.from(JSON.stringify(json));
-const pdfBytes = (text: string) => Buffer.from(`%PDF-fake\n${text}`);
+const bytes = (json: unknown): Buffer => Buffer.from(JSON.stringify(json));
+const converted = { _converted: { from: 'icbc_pdf' } };
+
+describe('bank amounts', () => {
+  it('parses both sign styles and formats like the API', () => {
+    expect(parseBankAmount('1.234,56-')).toBe(-1234.56);
+    expect(parseBankAmount('-1.234,56')).toBe(-1234.56);
+    expect(formatBankAmount(-1234567.5)).toBe('-1.234.567,50');
+    expect(formatBankAmount(0.4)).toBe('0,40');
+  });
+});
 
 describe('ICBC statement parser', () => {
-  it('parses columns, signs, dates and keeps the raw line', () => {
+  it('parses columns, signs, dates and the running balance', () => {
     const p = parseIcbcStatementText(statement());
     expect(p).toMatchObject({
-      source: 'icbc_pdf',
       account: ACCOUNT,
-      holderCuit: '30123456789',
       periodFrom: '2026-01-01',
       periodTo: '2026-01-31',
       openingBalance: 1000,
       closingBalance: 2000.25,
     });
-    expect(p.rows).toHaveLength(3);
-    expect(p.rows[0]).toMatchObject({
+    expect(p.lines).toHaveLength(3);
+    expect(p.lines[0]).toMatchObject({
       date: '2026-01-02',
       valueDate: '2025-12-31',
       concept: 'MANTENIMIENTO DE CUENTA',
       ticket: null,
       amount: -100,
-      balance: null,
-      rowKey: '2026-01#1',
+      balance: 900,
       raw: pdfLine(LINES[0]!),
     });
-    expect(p.rows[1]).toMatchObject({ ticket: '1000001', channel: 'DNET', amount: 1500.5 });
-    expect(p.rows[2]).toMatchObject({
-      concept: 'TR.0000001  A 0001/0000002',
-      ticket: 'MTA0000000001',
-      amount: -400.25,
-      balance: 2000.25,
-    });
+    expect(p.lines[1]).toMatchObject({ ticket: '1000001', channel: 'DNET', balance: 2400.5 });
+    expect(p.lines[2]).toMatchObject({ ticket: 'MTA0000000001', amount: -400.25 });
   });
 
   it('rejects a statement that does not close', () => {
     expect(() => parseIcbcStatementText(statement(LINES, '2.000,26'))).toThrow('no cierra');
   });
 
+  it('rejects a printed balance that differs from the running one', () => {
+    const wrong = LINES.map((l, i) => (i === 1 ? { ...l, balance: '2.400,51' } : l));
+    expect(() => parseIcbcStatementText(statement(wrong))).toThrow('no coincide');
+  });
+
   it('rejects copies that differ', () => {
     const other = LINES.map((l, i) => (i === 1 ? { ...l, ticket: '1000009' } : l));
-    const text = [copy(LINES, '1.000,00', '2.000,25'), copy(other, '1.000,00', '2.000,25')].join(
-      '\n'
-    );
+    const text = [copy(LINES, '2.000,25'), copy(other, '2.000,25')].join('\n');
     expect(() => parseIcbcStatementText(text)).toThrow('copias');
   });
 
@@ -161,32 +165,46 @@ describe('ICBC statement parser', () => {
 
 describe('ICBC API parser', () => {
   it('maps the fields, with dates in Argentina time', () => {
-    const p = parseIcbcApiJson(response([element(10)]));
+    const p = parseIcbcApiJson(response([element(1)]));
     expect(p).toMatchObject({ source: 'icbc_api', account: ACCOUNT, periodFrom: '2026-03-10' });
     expect(p.rows[0]).toMatchObject({
-      rowKey: '10',
+      transactionNumber: 1,
       date: '2026-03-10',
       valueDate: '2026-03-10',
       operatedAt: '2026-03-10T10:00:00',
       concept: 'TR. A CTA',
       conceptCode: '978',
       ticket: '1000001',
-      amount: -1500.5,
-      balance: 1000.25,
+      amount: -100,
+      balance: 9900,
       counterpartTaxId: '20123456789',
       reasonCode: '09',
       reason: 'HABERES',
-      raw: JSON.stringify(element(10)),
+      raw: JSON.stringify(element(1)),
     });
   });
 
+  it('orders by transaction number and marks converted files', () => {
+    const p = parseIcbcApiJson(response([element(3), element(1), element(2)], converted));
+    expect(p.source).toBe('icbc_pdf_converted');
+    expect(p.rows.map((r) => r.transactionNumber)).toEqual([1, 2, 3]);
+    expect(p.gaps).toEqual([]);
+  });
+
+  it('checks the balance chain, across holes too', () => {
+    const broken = element(2, { transactionBalance: '9.850,00' });
+    expect(() => parseIcbcApiJson(response([element(1), broken]))).toThrow('no encadenan');
+    const hole = element(3, { transactionBalance: formatBankAmount(9800) });
+    expect(parseIcbcApiJson(response([element(1), hole])).gaps).toEqual([{ after: 1, before: 3 }]);
+  });
+
   it('rejects incomplete, repeated or unrelated responses', () => {
-    expect(() => parseIcbcApiJson(response([element(1)], { hasMoreElements: true }))).toThrow(
-      'incompleta'
-    );
-    expect(() => parseIcbcApiJson(response([element(1)], { totalElementCount: 2 }))).toThrow(
-      'incompleta'
-    );
+    const incomplete = response([element(1)]);
+    incomplete.body.hasMoreElements = true;
+    expect(() => parseIcbcApiJson(incomplete)).toThrow('incompleta');
+    const short = response([element(1)]);
+    short.body.totalElementCount = 2;
+    expect(() => parseIcbcApiJson(short)).toThrow('incompleta');
     expect(() => parseIcbcApiJson(response([element(1), element(1)]))).toThrow('repetido');
     expect(() => parseIcbcApiJson({ state: 'ERROR' })).toThrow('no es una respuesta');
   });
@@ -198,74 +216,101 @@ describe('bronze import', () => {
     await runTestMigrations();
   });
   beforeEach(() => resetTestDb());
-  afterEach(() => vi.unstubAllEnvs());
 
   const service = () => new BankImportService();
   const repo = () => new BankRepository();
+  const imp = (json: unknown, name = 'api.json') => service().importFile(bytes(json), name);
 
-  it('stores each source with its own rows and origin', async () => {
-    const pdf = await service().importFile(pdfBytes(statement()), 'enero.pdf');
-    const api = await service().importFile(bytes(response([element(1)])), 'api.json');
-    expect(pdf).toMatchObject({ newRows: 3, alreadyImported: false });
+  it('stores each movement with its origin, in bank order', () => {
+    const seed = imp(response([element(1), element(2)], converted), 'seed.json');
+    const api = imp(response([element(4), element(3)]));
+    expect(seed).toMatchObject({ newRows: 2, alreadyImported: false, warnings: [] });
+    expect(api.warnings).toEqual([]);
     const rows = repo().listMovements();
-    expect(rows.map((r) => r.source)).toEqual(['icbc_pdf', 'icbc_pdf', 'icbc_pdf', 'icbc_api']);
-    expect(rows[3]).toMatchObject({ importId: api.import.id, rowNumber: 1 });
-    expect(repo().listMovements({ importId: pdf.import.id })).toHaveLength(3);
+    expect(rows.map((r) => [r.transactionNumber, r.source, r.version])).toEqual([
+      [1, 'icbc_pdf_converted', 1],
+      [2, 'icbc_pdf_converted', 1],
+      [3, 'icbc_api', 1],
+      [4, 'icbc_api', 1],
+    ]);
+    expect(rows[2]!.importId).toBe(api.import.id);
   });
 
-  it('does nothing when the same file is imported again', async () => {
-    await service().importFile(pdfBytes(statement()), 'enero.pdf');
-    const again = await service().importFile(pdfBytes(statement()), 'copia.pdf');
-    expect(again).toMatchObject({ alreadyImported: true, newRows: 0, knownRows: 3 });
+  it('does nothing when the same file is imported again', () => {
+    imp(response([element(1)]));
+    expect(imp(response([element(1)]), 'copia.json')).toMatchObject({
+      alreadyImported: true,
+      newRows: 0,
+    });
     expect(repo().listImports()).toHaveLength(1);
   });
 
-  it('adds only the new rows of an overlapping API download', async () => {
-    await service().importFile(bytes(response([element(1), element(2)])), 'a.json');
-    const next = await service().importFile(bytes(response([element(2), element(3)])), 'b.json');
-    expect(next).toMatchObject({ newRows: 1, knownRows: 1, changedRows: 0 });
-    expect(
-      repo()
-        .listMovements()
-        .map((r) => r.rowKey)
-    ).toEqual(['1', '2', '3']);
+  it('adds only the new rows of an overlapping download', () => {
+    imp(response([element(1), element(2)]));
+    expect(imp(response([element(2), element(3)]), 'b.json')).toMatchObject({
+      newRows: 1,
+      knownRows: 1,
+      changedRows: 0,
+    });
+    expect(repo().listMovements()).toHaveLength(3);
   });
 
-  it('ignores UI actions and key order, and versions real changes', async () => {
+  it('versions real changes, also back to an earlier content', () => {
     const { action: _action, ...rest } = element(1);
-    await service().importFile(bytes(response([element(1)])), 'a.json');
-    const same = await service().importFile(
-      bytes(response([Object.fromEntries(Object.entries(rest).reverse())])),
-      'b.json'
-    );
-    expect(same.newRows).toBe(0);
-    const changed = await service().importFile(
-      bytes(response([element(1, { reason: 'FACTURA' })])),
-      'c.json'
-    );
-    expect(changed).toMatchObject({ newRows: 1, changedRows: 1 });
+    imp(response([element(1)]), 'a.json');
+    const reordered = Object.fromEntries(Object.entries(rest).reverse());
+    expect(imp(response([reordered]), 'b.json').knownRows).toBe(1);
+    expect(imp(response([element(1, { reason: 'FACTURA' })]), 'c.json')).toMatchObject({
+      newRows: 0,
+      changedRows: 1,
+    });
+    expect(imp(response([element(1), element(2)]), 'd.json')).toMatchObject({
+      newRows: 1,
+      changedRows: 1,
+    });
+    expect(
+      repo()
+        .listMovements({ allVersions: true })
+        .map((r) => [r.version, r.reason])
+    ).toEqual([
+      [1, 'HABERES'],
+      [2, 'FACTURA'],
+      [3, 'HABERES'],
+      [1, 'HABERES'],
+    ]);
     expect(
       repo()
         .listMovements()
-        .map((r) => r.reason)
-    ).toEqual(['HABERES', 'FACTURA']);
+        .map((r) => r.version)
+    ).toEqual([3, 1]);
   });
 
-  it('is immutable at the database level', async () => {
-    await service().importFile(bytes(response([element(1)])), 'a.json');
+  it('warns when the balance does not chain with stored rows', () => {
+    imp(response([element(1)]));
+    const off = element(2, { transactionBalance: '5.000,00' });
+    expect(imp(response([off]), 'b.json').warnings).toEqual([
+      'El saldo no encadena con el movimiento 1 ya cargado',
+    ]);
+  });
+
+  it('rejects another account and a number already loaded from another source', () => {
+    imp(response([element(1)]));
+    expect(() =>
+      imp(response([element(2, { accountNumber: '0002/00000002/02' })]), 'b.json')
+    ).toThrow('cuenta');
+    expect(() => imp(response([element(1, { reason: 'X' })], converted), 'c.json')).toThrow(
+      'otra fuente'
+    );
+    expect(repo().listImports()).toHaveLength(1);
+  });
+
+  it('is immutable at the database level', () => {
+    imp(response([element(1)]));
     const db = getRawDb();
     for (const table of ['bank_imports', 'bank_movements']) {
       expect(() => db.exec(`UPDATE ${table} SET account = 'x'`)).toThrow('immutable');
       expect(() => db.exec(`DELETE FROM ${table}`)).toThrow('immutable');
     }
-  });
-
-  it('rejects a statement of another CUIT without writing', async () => {
-    vi.stubEnv('COMPANY_CUIT', '23-12345678-9');
-    await expect(service().importFile(pdfBytes(statement()), 'x.pdf')).rejects.toThrow(
-      'El resumen'
-    );
-    expect(repo().listImports()).toHaveLength(0);
   });
 
   it('serves the API', async () => {
@@ -277,12 +322,20 @@ describe('bronze import', () => {
     const ok = await post(JSON.stringify(response([element(1)])), 'api.json');
     expect(ok.status).toBe(200);
     expect(await ok.json()).toMatchObject({ success: true, newRows: 1 });
-    expect((await post('fecha;importe', 'x.csv')).status).toBe(400);
+    const pdf = await post('%PDF-1.4 ...', 'resumen.pdf');
+    expect(pdf.status).toBe(400);
+    expect(await pdf.json()).toMatchObject({ error: expect.stringContaining('se convierten') });
+    await post(JSON.stringify(response([element(1, { reason: 'FACTURA' })])), 'b.json');
 
-    const list = await app.request('/api/bank/movements?source=icbc_api&from=2026-03-10');
-    expect(await list.json()).toMatchObject({ count: 1, movements: [{ rowKey: '1' }] });
+    const latest = await app.request('/api/bank/movements?source=icbc_api&from=2026-03-10');
+    expect(await latest.json()).toMatchObject({ count: 1, movements: [{ version: 2 }] });
+    const all = await app.request('/api/bank/movements?versions=all');
+    expect(await all.json()).toMatchObject({ count: 2 });
     expect((await app.request('/api/bank/movements?source=other')).status).toBe(400);
     const imports = await app.request('/api/bank/imports');
-    expect(await imports.json()).toMatchObject({ count: 1, imports: [{ filename: 'api.json' }] });
+    expect(await imports.json()).toMatchObject({
+      count: 2,
+      imports: [{ filename: 'api.json' }, { filename: 'b.json' }],
+    });
   });
 });
