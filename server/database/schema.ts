@@ -465,13 +465,14 @@ const issuedInvoices_ = sqliteTable(
 export { issuedInvoices_ as issuedInvoices };
 
 // =============================================================================
-// BANK STATEMENTS - bronze layer. One row per line of every source (monthly PDF,
-// API JSON), append-only: UPDATE/DELETE are blocked by triggers (see migration).
-// The same real movement shows up once per source; silver links them.
+// BANK STATEMENTS - bronze layer, append-only (UPDATE/DELETE blocked by
+// triggers, see migration). Input is always the ICBC API JSON; the monthly PDFs
+// before the API window are converted once to that JSON (scripts/icbc-pdf-to-json.ts),
+// with an invented transaction_number and the PDF line kept in `raw`.
 // =============================================================================
 
-/** Sources a bronze bank row can come from. */
-export const BANK_SOURCES = ['icbc_pdf', 'icbc_api'] as const;
+/** Where a bronze bank row came from. */
+export const BANK_SOURCES = ['icbc_api', 'icbc_pdf_converted'] as const;
 export type BankSource = (typeof BANK_SOURCES)[number];
 
 const bankImports_ = sqliteTable(
@@ -484,9 +485,7 @@ const bankImports_ = sqliteTable(
     account: text('account').notNull(), // as printed by the bank, e.g. 0000/00000000/00
     periodFrom: text('period_from').notNull(), // YYYY-MM-DD
     periodTo: text('period_to').notNull(),
-    openingBalance: real('opening_balance'), // PDF only
-    closingBalance: real('closing_balance'), // PDF only
-    rowCount: integer('row_count').notNull(), // rows in the file
+    rowCount: integer('row_count').notNull(), // movements in the file
     newCount: integer('new_count').notNull(), // rows inserted by this import
     importedAt: text('imported_at')
       .notNull()
@@ -503,38 +502,36 @@ const bankMovements_ = sqliteTable(
   'bank_movements',
   {
     id: integer('id').primaryKey({ autoIncrement: true }),
-    importId: integer('import_id') // first import that brought this row
+    importId: integer('import_id') // import that brought this version
       .notNull()
       .references(() => bankImports_.id),
     source: text('source', { enum: BANK_SOURCES }).notNull(),
     account: text('account').notNull(),
-    rowNumber: integer('row_number').notNull(), // position within the source file (1-based)
-    rowKey: text('row_key').notNull(), // API: transactionNumber; PDF: <YYYY-MM>#<ordinal>
+    transactionNumber: integer('transaction_number').notNull(), // bank sequence; invented if converted
+    version: integer('version').notNull(), // 1, then +1 each time the bank changes the row
     contentHash: text('content_hash').notNull(), // sha256 of the row content
-    date: text('date').notNull(), // YYYY-MM-DD
+    date: text('date').notNull(), // YYYY-MM-DD (accounting date)
     valueDate: text('value_date'),
-    operatedAt: text('operated_at'), // ISO datetime, API only
+    operatedAt: text('operated_at'), // ISO local datetime; API only, does not order
     concept: text('concept').notNull(),
-    conceptCode: text('concept_code'), // API only
-    ticket: text('ticket'), // PDF COMPROBANTE / API ticketNumber
+    conceptCode: text('concept_code'),
+    ticket: text('ticket'), // API ticketNumber = PDF COMPROBANTE
     amount: real('amount').notNull(), // signed: debits are negative
-    balance: real('balance'), // running balance; PDF prints it only at day end
-    origin: text('origin'), // PDF only
+    balance: real('balance').notNull(), // after this movement (computed if converted)
     channel: text('channel'),
-    counterpartName: text('counterpart_name'), // API only
-    counterpartTaxId: text('counterpart_tax_id'), // digits only, API only
-    counterpartCbu: text('counterpart_cbu'), // API only
-    counterpartBank: text('counterpart_bank'), // API only
-    reasonCode: text('reason_code'), // API only
-    reason: text('reason'), // API only
-    raw: text('raw').notNull(), // untouched source line (PDF text line or JSON element)
+    counterpartName: text('counterpart_name'),
+    counterpartTaxId: text('counterpart_tax_id'), // digits only
+    counterpartCbu: text('counterpart_cbu'),
+    counterpartBank: text('counterpart_bank'),
+    reasonCode: text('reason_code'),
+    reason: text('reason'),
+    raw: text('raw').notNull(), // untouched JSON element (with the PDF line if converted)
   },
   (table) => ({
-    uniqueRow: uniqueIndex('unique_bank_movement_row').on(
-      table.source,
+    uniqueVersion: uniqueIndex('unique_bank_movement_version').on(
       table.account,
-      table.rowKey,
-      table.contentHash
+      table.transactionNumber,
+      table.version
     ),
     dateIdx: index('idx_bank_movements_date').on(table.date),
     ticketIdx: index('idx_bank_movements_ticket').on(table.ticket),

@@ -1,9 +1,10 @@
--- Migration: bank statements, bronze layer (ICBC monthly PDF and API JSON)
+-- Migration: bank statements, bronze layer (ICBC API JSON)
 --
--- One row per line of every source, append-only. The same real movement shows
--- up once per source. A row seen again with identical content is not repeated;
--- if the bank changes it, it is added as a new version (different content_hash).
--- Triggers block UPDATE and DELETE so bronze stays immutable.
+-- Append-only. Input is always the ICBC API JSON; the monthly PDFs before the
+-- API window are converted once to that JSON (scripts/icbc-pdf-to-json.ts),
+-- with an invented transaction_number and the PDF line kept in `raw`.
+-- A row seen again with identical content is not repeated; if the bank changes
+-- it, it is added as the next version. Triggers block UPDATE and DELETE.
 --
 -- Idempotent on purpose: migrations are applied by hand in production
 -- (drizzle migration tracking is out of sync there).
@@ -16,8 +17,6 @@ CREATE TABLE IF NOT EXISTS `bank_imports` (
 	`account` text NOT NULL,
 	`period_from` text NOT NULL,
 	`period_to` text NOT NULL,
-	`opening_balance` real,
-	`closing_balance` real,
 	`row_count` integer NOT NULL,
 	`new_count` integer NOT NULL,
 	`imported_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL
@@ -30,8 +29,8 @@ CREATE TABLE IF NOT EXISTS `bank_movements` (
 	`import_id` integer NOT NULL,
 	`source` text NOT NULL,
 	`account` text NOT NULL,
-	`row_number` integer NOT NULL,
-	`row_key` text NOT NULL,
+	`transaction_number` integer NOT NULL,
+	`version` integer NOT NULL,
 	`content_hash` text NOT NULL,
 	`date` text NOT NULL,
 	`value_date` text,
@@ -40,8 +39,7 @@ CREATE TABLE IF NOT EXISTS `bank_movements` (
 	`concept_code` text,
 	`ticket` text,
 	`amount` real NOT NULL,
-	`balance` real,
-	`origin` text,
+	`balance` real NOT NULL,
 	`channel` text,
 	`counterpart_name` text,
 	`counterpart_tax_id` text,
@@ -53,7 +51,7 @@ CREATE TABLE IF NOT EXISTS `bank_movements` (
 	FOREIGN KEY (`import_id`) REFERENCES `bank_imports`(`id`)
 );
 --> statement-breakpoint
-CREATE UNIQUE INDEX IF NOT EXISTS `unique_bank_movement_row` ON `bank_movements` (`source`, `account`, `row_key`, `content_hash`);
+CREATE UNIQUE INDEX IF NOT EXISTS `unique_bank_movement_version` ON `bank_movements` (`account`, `transaction_number`, `version`);
 --> statement-breakpoint
 CREATE INDEX IF NOT EXISTS `idx_bank_movements_date` ON `bank_movements` (`date`);
 --> statement-breakpoint
