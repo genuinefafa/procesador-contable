@@ -22,6 +22,8 @@
     "db:refresh-status": "bun scripts/refresh-link-status.ts",
     "db:seed": "tsx scripts/seed.ts",
     "db:reset": "rm -f ../data/database.sqlite && tsx scripts/migrate.ts",
+    "bank:import": "bun scripts/import-bank.ts",
+    "bank:pdf-to-json": "bun scripts/icbc-pdf-to-json.ts",
     "reconcile-files": "tsx scripts/reconcile-files.ts",
     "dev:hono": "tsx watch http/server.ts"
   },

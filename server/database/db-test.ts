@@ -32,6 +32,14 @@ export function resetTestDb(): void {
   // Desactivar foreign keys temporalmente para truncar
   getRawDb().exec('PRAGMA foreign_keys = OFF');
 
+  // Bronze tables block DELETE with triggers: drop them while truncating
+  const triggers = getRawDb()
+    .prepare("SELECT name, sql FROM sqlite_master WHERE type='trigger'")
+    .all() as { name: string; sql: string }[];
+  for (const trigger of triggers) {
+    getRawDb().exec(`DROP TRIGGER "${trigger.name}"`);
+  }
+
   // Obtener todas las tablas
   const tables = getRawDb()
     .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
@@ -49,6 +57,10 @@ export function resetTestDb(): void {
     .get();
   if (sqliteSequenceExists) {
     getRawDb().prepare('DELETE FROM sqlite_sequence').run();
+  }
+
+  for (const trigger of triggers) {
+    getRawDb().exec(trigger.sql);
   }
 
   // Reactivar foreign keys
